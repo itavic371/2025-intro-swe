@@ -42,9 +42,15 @@ function Navigation() {
           {/* User Info */}
           {user && (
             <div className="navbar-user">
+              {user.isAdmin && (
+                <Link to="/admin" className="navbar-admin">
+                  ⚙️ Admin
+                </Link>
+              )}
               <Link to="/profile" className="navbar-profile">
                 <span className="user-icon">👤</span>
                 <span className="user-email">{user.email?.split("@")[0]}</span>
+                {user.isAdmin && <span className="admin-star">⭐</span>}
               </Link>
               <button className="navbar-logout" onClick={logout}>
                 🚪 {t.logout}

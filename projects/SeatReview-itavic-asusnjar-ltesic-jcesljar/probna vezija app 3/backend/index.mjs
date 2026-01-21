@@ -87,9 +87,15 @@ db.serialize(() => {
       password_hash TEXT NOT NULL,
       verification_code TEXT,
       is_verified INTEGER DEFAULT 0,
+      is_admin INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
+
+  // Add is_admin column if it doesn't exist (for existing databases)
+  db.run(`ALTER TABLE User ADD COLUMN is_admin INTEGER DEFAULT 0`, (err) => {
+    // Ignore error if column already exists
+  });
 
   // Venues with category (stadium/arena)
   db.run(`
@@ -206,6 +212,12 @@ db.serialize(() => {
       UNIQUE(follower_id, following_id)
     );
   `);
+
+  // Make specific emails admin by default
+  const adminEmails = ["itavic371@gmail.com", "admin@seatreview.com"];
+  adminEmails.forEach(email => {
+    db.run("UPDATE User SET is_admin = 1 WHERE email = ?", [email]);
+  });
 
   // Seed example venues
   db.get("SELECT COUNT(*) AS count FROM Venue", (err, row) => {
@@ -363,6 +375,20 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// --- ADMIN MIDDLEWARE ---
+const requireAdmin = async (req, res, next) => {
+  try {
+    const user = await getAsync("SELECT is_admin FROM User WHERE id = ?", [req.user.userId]);
+    if (!user || !user.is_admin) {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    next();
+  } catch (err) {
+    console.error("Admin check error:", err);
+    res.status(500).json({ error: "Failed to verify admin status" });
+  }
+};
+
 // --- AUTH ROUTES ---
 
 // Register
@@ -391,9 +417,13 @@ app.post("/api/auth/register", async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const verificationCode = generateVerificationCode();
 
+    // Check if email should be admin
+    const adminEmails = ["itavic371@gmail.com", "admin@seatreview.com"];
+    const isAdmin = adminEmails.includes(email.toLowerCase()) ? 1 : 0;
+
     const result = await runAsync(
-      "INSERT INTO User (email, password_hash, verification_code) VALUES (?, ?, ?)",
-      [email, passwordHash, verificationCode]
+      "INSERT INTO User (email, password_hash, verification_code, is_admin) VALUES (?, ?, ?, ?)",
+      [email, passwordHash, verificationCode, isAdmin]
     );
 
     // Send verification code via email
@@ -481,7 +511,7 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const token = jwt.sign(
-      { userId: user.id, email: user.email },
+      { userId: user.id, email: user.email, isAdmin: user.is_admin === 1 },
       JWT_SECRET,
       { expiresIn: "30d" }
     );
@@ -491,7 +521,8 @@ app.post("/api/auth/login", async (req, res) => {
       token,
       user: {
         id: user.id,
-        email: user.email
+        email: user.email,
+        isAdmin: user.is_admin === 1
       }
     });
   } catch (err) {
@@ -504,7 +535,7 @@ app.post("/api/auth/login", async (req, res) => {
 app.get("/api/auth/me", authenticateToken, async (req, res) => {
   try {
     const user = await getAsync(
-      "SELECT id, email, created_at FROM User WHERE id = ?",
+      "SELECT id, email, is_admin, created_at FROM User WHERE id = ?",
       [req.user.userId]
     );
     if (!user) {
@@ -519,6 +550,7 @@ app.get("/api/auth/me", authenticateToken, async (req, res) => {
 
     res.json({
       ...user,
+      isAdmin: user.is_admin === 1,
       reviewCount: reviewCount.count
     });
   } catch (err) {
@@ -916,6 +948,260 @@ app.post("/api/venues/:id/insights/generate", authenticateToken, async (req, res
 // Health check
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
+});
+
+// --- PUBLIC VENUE IMAGES (for all logged-in users) ---
+app.get("/api/venues/:id/images", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const images = await allAsync(
+      "SELECT id, file_path, is_360 FROM Photo WHERE venue_id = ? ORDER BY id DESC",
+      [id]
+    );
+    res.json({ images });
+  } catch (err) {
+    console.error("Error fetching venue images:", err);
+    res.status(500).json({ error: "Failed to fetch images" });
+  }
+});
+
+// --- ADMIN ROUTES ---
+
+// Get all users (admin only)
+app.get("/api/admin/users", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const users = await allAsync(
+      `SELECT id, email, is_verified, is_admin, created_at,
+       (SELECT COUNT(*) FROM Review WHERE user_id = User.id) as review_count
+       FROM User ORDER BY created_at DESC`
+    );
+    res.json({ users });
+  } catch (err) {
+    console.error("Error fetching users:", err);
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+// Toggle user admin status (admin only)
+app.put("/api/admin/users/:id/toggle-admin", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Prevent self-demotion
+    if (parseInt(id) === req.user.userId) {
+      return res.status(400).json({ error: "Cannot change your own admin status" });
+    }
+
+    const user = await getAsync("SELECT is_admin FROM User WHERE id = ?", [id]);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const newStatus = user.is_admin ? 0 : 1;
+    await runAsync("UPDATE User SET is_admin = ? WHERE id = ?", [newStatus, id]);
+
+    res.json({ message: "Admin status updated", isAdmin: newStatus === 1 });
+  } catch (err) {
+    console.error("Error toggling admin:", err);
+    res.status(500).json({ error: "Failed to toggle admin status" });
+  }
+});
+
+// Delete user (admin only)
+app.delete("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Prevent self-deletion
+    if (parseInt(id) === req.user.userId) {
+      return res.status(400).json({ error: "Cannot delete yourself" });
+    }
+
+    await runAsync("DELETE FROM Review WHERE user_id = ?", [id]);
+    await runAsync("DELETE FROM Favorite WHERE user_id = ?", [id]);
+    await runAsync("DELETE FROM ViewHistory WHERE user_id = ?", [id]);
+    await runAsync("DELETE FROM Comment WHERE user_id = ?", [id]);
+    await runAsync("DELETE FROM UserFollow WHERE follower_id = ? OR following_id = ?", [id, id]);
+    await runAsync("DELETE FROM User WHERE id = ?", [id]);
+
+    res.json({ message: "User deleted" });
+  } catch (err) {
+    console.error("Error deleting user:", err);
+    res.status(500).json({ error: "Failed to delete user" });
+  }
+});
+
+// Create venue (admin only)
+app.post("/api/admin/venues", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { name, address, type, category } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: "Venue name is required" });
+    }
+
+    const result = await runAsync(
+      "INSERT INTO Venue (name, address, type, category) VALUES (?, ?, ?, ?)",
+      [name, address || null, type || null, category || "stadium"]
+    );
+
+    res.status(201).json({
+      message: "Venue created",
+      venue: {
+        id: result.lastID,
+        name,
+        address,
+        type,
+        category
+      }
+    });
+  } catch (err) {
+    console.error("Error creating venue:", err);
+    res.status(500).json({ error: "Failed to create venue" });
+  }
+});
+
+// Update venue (admin only)
+app.put("/api/admin/venues/:id", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, address, type, category } = req.body;
+
+    const venue = await getAsync("SELECT * FROM Venue WHERE id = ?", [id]);
+    if (!venue) {
+      return res.status(404).json({ error: "Venue not found" });
+    }
+
+    await runAsync(
+      "UPDATE Venue SET name = ?, address = ?, type = ?, category = ? WHERE id = ?",
+      [name || venue.name, address || venue.address, type || venue.type, category || venue.category, id]
+    );
+
+    res.json({ message: "Venue updated" });
+  } catch (err) {
+    console.error("Error updating venue:", err);
+    res.status(500).json({ error: "Failed to update venue" });
+  }
+});
+
+// Delete venue (admin only)
+app.delete("/api/admin/venues/:id", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Delete related data first
+    await runAsync("DELETE FROM Review WHERE venue_id = ?", [id]);
+    await runAsync("DELETE FROM Photo WHERE venue_id = ?", [id]);
+    await runAsync("DELETE FROM Favorite WHERE venue_id = ?", [id]);
+    await runAsync("DELETE FROM ViewHistory WHERE venue_id = ?", [id]);
+    await runAsync("DELETE FROM AIInsight WHERE venue_id = ?", [id]);
+    await runAsync("DELETE FROM Venue WHERE id = ?", [id]);
+
+    res.json({ message: "Venue deleted" });
+  } catch (err) {
+    console.error("Error deleting venue:", err);
+    res.status(500).json({ error: "Failed to delete venue" });
+  }
+});
+
+// Upload venue images (admin only)
+app.post("/api/admin/venues/:id/images", authenticateToken, requireAdmin, upload.array("images", 10), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_360 } = req.body;
+
+    const venue = await getAsync("SELECT * FROM Venue WHERE id = ?", [id]);
+    if (!venue) {
+      return res.status(404).json({ error: "Venue not found" });
+    }
+
+    const files = req.files || [];
+    if (files.length === 0) {
+      return res.status(400).json({ error: "No images uploaded" });
+    }
+
+    const uploadedImages = [];
+    for (const file of files) {
+      const relPath = `/uploads/${file.filename}`;
+      const result = await runAsync(
+        "INSERT INTO Photo (venue_id, file_path, is_360) VALUES (?, ?, ?)",
+        [id, relPath, is_360 === "true" ? 1 : 0]
+      );
+      uploadedImages.push({
+        id: result.lastID,
+        file_path: relPath,
+        is_360: is_360 === "true"
+      });
+    }
+
+    res.status(201).json({
+      message: `${files.length} image(s) uploaded successfully`,
+      images: uploadedImages
+    });
+  } catch (err) {
+    console.error("Error uploading images:", err);
+    res.status(500).json({ error: "Failed to upload images" });
+  }
+});
+
+// Get venue images (admin)
+app.get("/api/admin/venues/:id/images", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const images = await allAsync(
+      "SELECT * FROM Photo WHERE venue_id = ? ORDER BY id DESC",
+      [id]
+    );
+    res.json({ images });
+  } catch (err) {
+    console.error("Error fetching images:", err);
+    res.status(500).json({ error: "Failed to fetch images" });
+  }
+});
+
+// Delete venue image (admin only)
+app.delete("/api/admin/images/:imageId", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { imageId } = req.params;
+
+    const image = await getAsync("SELECT * FROM Photo WHERE id = ?", [imageId]);
+    if (!image) {
+      return res.status(404).json({ error: "Image not found" });
+    }
+
+    // Delete file from filesystem
+    const filePath = path.join(__dirname, image.file_path);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+
+    await runAsync("DELETE FROM Photo WHERE id = ?", [imageId]);
+
+    res.json({ message: "Image deleted" });
+  } catch (err) {
+    console.error("Error deleting image:", err);
+    res.status(500).json({ error: "Failed to delete image" });
+  }
+});
+
+// Get admin stats
+app.get("/api/admin/stats", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userCount = await getAsync("SELECT COUNT(*) as count FROM User");
+    const venueCount = await getAsync("SELECT COUNT(*) as count FROM Venue");
+    const reviewCount = await getAsync("SELECT COUNT(*) as count FROM Review");
+    const photoCount = await getAsync("SELECT COUNT(*) as count FROM Photo");
+
+    res.json({
+      users: userCount.count,
+      venues: venueCount.count,
+      reviews: reviewCount.count,
+      photos: photoCount.count
+    });
+  } catch (err) {
+    console.error("Error fetching stats:", err);
+    res.status(500).json({ error: "Failed to fetch stats" });
+  }
 });
 
 // Get all seats for a venue with prices and ratings

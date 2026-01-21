@@ -3,7 +3,6 @@ import { useAuth } from "./AuthContext";
 import { useLanguage } from "./LanguageContext";
 import { translations } from "./translations";
 import Navigation from "./Navigation";
-import Photo360Viewer from "./Photo360Viewer";
 import SeatMap from "./SeatMap";
 import Favorites from "./Favorites";
 import ViewHistory from "./ViewHistory";
@@ -19,7 +18,7 @@ function App() {
   const [category, setCategory] = useState("");
   const [venues, setVenues] = useState([]);
   const [selectedVenueId, setSelectedVenueId] = useState("");
-  const [tab, setTab] = useState("360view");
+  const [tab, setTab] = useState("seatmap");
   const [autoSelectSeat, setAutoSelectSeat] = useState(null);
 
   useEffect(() => {
@@ -168,12 +167,6 @@ function App() {
               🎫 {t.tabSeatMap || "Seat Map"}
             </button>
             <button
-              className={tab === "360view" ? "tab active" : "tab"}
-              onClick={() => setTab("360view")}
-            >
-              🌐 {t.tab360Views}
-            </button>
-            <button
               className={tab === "reviews" ? "tab active" : "tab"}
               onClick={() => setTab("reviews")}
             >
@@ -225,7 +218,6 @@ function App() {
               autoSelectSeat={autoSelectSeat}
             />
           )}
-          {tab === "360view" && <Photo360Viewer venueId={selectedVenueId} />}
           {tab === "reviews" && <AllReviews venueId={selectedVenueId} />}
           {tab === "submit" && <ReviewForm venueId={selectedVenueId} token={token} />}
           {tab === "gallery" && <VenueGallery venueId={selectedVenueId} />}
