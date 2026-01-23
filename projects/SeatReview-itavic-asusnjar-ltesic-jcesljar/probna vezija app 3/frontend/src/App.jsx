@@ -234,8 +234,11 @@ function App() {
 
 // New component to show all reviews
 function AllReviews({ venueId }) {
+  const { token } = useAuth();
   const [reviews, setReviews] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [votes, setVotes] = useState({}); // { reviewId: { likes, dislikes } }
+  const [userVotes, setUserVotes] = useState({}); // { reviewId: 'like' | 'dislike' | null }
 
   useEffect(() => {
     fetch(`${API_BASE}/venues/${venueId}/reviews`)
@@ -243,12 +246,71 @@ function AllReviews({ venueId }) {
       .then((data) => {
         setReviews(data);
         setLoading(false);
+        // Fetch votes for each review
+        data.forEach((review) => {
+          fetchVotes(review.id);
+          if (token) {
+            fetchUserVote(review.id);
+          }
+        });
       })
       .catch((e) => {
         console.error(e);
         setLoading(false);
       });
-  }, [venueId]);
+  }, [venueId, token]);
+
+  const fetchVotes = async (reviewId) => {
+    try {
+      const res = await fetch(`${API_BASE}/reviews/${reviewId}/votes`);
+      if (res.ok) {
+        const data = await res.json();
+        setVotes((prev) => ({ ...prev, [reviewId]: data }));
+      }
+    } catch (err) {
+      console.error("Error fetching votes:", err);
+    }
+  };
+
+  const fetchUserVote = async (reviewId) => {
+    try {
+      const res = await fetch(`${API_BASE}/reviews/${reviewId}/my-vote`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setUserVotes((prev) => ({ ...prev, [reviewId]: data.vote_type }));
+      }
+    } catch (err) {
+      console.error("Error fetching user vote:", err);
+    }
+  };
+
+  const handleVote = async (reviewId, voteType) => {
+    if (!token) {
+      alert("Morate biti prijavljeni da biste glasali");
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/reviews/${reviewId}/vote`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ vote_type: voteType })
+      });
+
+      if (res.ok) {
+        // Refresh votes
+        fetchVotes(reviewId);
+        fetchUserVote(reviewId);
+      }
+    } catch (err) {
+      console.error("Error voting:", err);
+    }
+  };
 
   if (loading) return <div className="loading-small">Loading reviews...</div>;
 
@@ -272,13 +334,13 @@ function AllReviews({ venueId }) {
               <span className="review-badge">Seat: {review.seat_number || "N/A"}</span>
             </div>
             <div className="review-user">
-              👤 {review.user_email?.split("@")[0] || "Anonymous"}
+              {review.user_email?.split("@")[0] || "Anonymous"}
             </div>
           </div>
 
           <div className="review-ratings">
             <div className="rating-item">
-              <span className="rating-label">🛋️ Comfort</span>
+              <span className="rating-label">Comfort</span>
               <div className="rating-stars">
                 {"★".repeat(review.rating_comfort || 0)}
                 {"☆".repeat(5 - (review.rating_comfort || 0))}
@@ -286,7 +348,7 @@ function AllReviews({ venueId }) {
               <span className="rating-value">{review.rating_comfort || "N/A"}/5</span>
             </div>
             <div className="rating-item">
-              <span className="rating-label">🦵 Legroom</span>
+              <span className="rating-label">Legroom</span>
               <div className="rating-stars">
                 {"★".repeat(review.rating_legroom || 0)}
                 {"☆".repeat(5 - (review.rating_legroom || 0))}
@@ -294,7 +356,7 @@ function AllReviews({ venueId }) {
               <span className="rating-value">{review.rating_legroom || "N/A"}/5</span>
             </div>
             <div className="rating-item">
-              <span className="rating-label">👁️ Visibility</span>
+              <span className="rating-label">Visibility</span>
               <div className="rating-stars">
                 {"★".repeat(review.rating_visibility || 0)}
                 {"☆".repeat(5 - (review.rating_visibility || 0))}
@@ -302,7 +364,7 @@ function AllReviews({ venueId }) {
               <span className="rating-value">{review.rating_visibility || "N/A"}/5</span>
             </div>
             <div className="rating-item">
-              <span className="rating-label">✨ Cleanliness</span>
+              <span className="rating-label">Cleanliness</span>
               <div className="rating-stars">
                 {"★".repeat(review.rating_cleanliness || 0)}
                 {"☆".repeat(5 - (review.rating_cleanliness || 0))}
@@ -325,6 +387,24 @@ function AllReviews({ venueId }) {
                 day: "numeric"
               })}
             </span>
+            <div className="review-votes">
+              <button
+                className={`vote-btn vote-like ${userVotes[review.id] === 'like' ? 'active' : ''}`}
+                onClick={() => handleVote(review.id, 'like')}
+                title="Svidja mi se"
+              >
+                <span className="vote-icon">👍</span>
+                <span className="vote-count">{votes[review.id]?.likes || 0}</span>
+              </button>
+              <button
+                className={`vote-btn vote-dislike ${userVotes[review.id] === 'dislike' ? 'active' : ''}`}
+                onClick={() => handleVote(review.id, 'dislike')}
+                title="Ne svidja mi se"
+              >
+                <span className="vote-icon">👎</span>
+                <span className="vote-count">{votes[review.id]?.dislikes || 0}</span>
+              </button>
+            </div>
           </div>
         </div>
       ))}
@@ -551,30 +631,202 @@ function ReviewForm({ venueId, token }) {
   );
 }
 
-// VenueGallery component
+// VenueGallery component - SeatGeek style with sector views + Virtual Tour
 function VenueGallery({ venueId }) {
   const [photos, setPhotos] = useState([]);
+  const [selectedSection, setSelectedSection] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [venue, setVenue] = useState(null);
+  const [showVirtualTour, setShowVirtualTour] = useState(false);
 
   useEffect(() => {
-    fetch(`${API_BASE}/venues/${venueId}/photos`)
+    // Fetch venue details (for virtual tour URL)
+    fetch(`${API_BASE}/venues/${venueId}`)
       .then((r) => r.json())
-      .then(setPhotos)
+      .then((data) => {
+        setVenue(data);
+      })
       .catch((e) => console.error(e));
+
+    // Fetch gallery photos with section info
+    fetch(`${API_BASE}/venues/${venueId}/gallery`)
+      .then((r) => r.json())
+      .then((data) => {
+        setPhotos(data);
+        setLoading(false);
+      })
+      .catch((e) => {
+        console.error(e);
+        setLoading(false);
+      });
   }, [venueId]);
 
+  // Group photos by section
+  const sectionGroups = photos.reduce((acc, photo) => {
+    const section = photo.section || "General";
+    if (!acc[section]) {
+      acc[section] = [];
+    }
+    acc[section].push(photo);
+    return acc;
+  }, {});
+
+  const sections = Object.keys(sectionGroups);
+
+  if (loading) {
+    return <div className="loading-small">Loading gallery...</div>;
+  }
+
+  // Check if venue has virtual tour
+  const hasVirtualTour = venue && venue.virtual_tour_url;
+
+  // Get clean tour URL (add parameters to hide branding for Matterport)
+  const getTourUrl = () => {
+    if (!venue || !venue.virtual_tour_url) return '';
+    let url = venue.virtual_tour_url;
+    // For Matterport tours, add parameters to hide branding
+    if (url.includes('matterport.com')) {
+      const separator = url.includes('?') ? '&' : '?';
+      url += `${separator}play=1&qs=1&brand=0&mls=2&wh=0&guides=0&title=0`;
+    }
+    return url;
+  };
+
   return (
-    <div className="card">
-      <h3>Venue Photo Gallery</h3>
-      {photos.length === 0 ? (
-        <p className="no-content">No photos yet.</p>
-      ) : (
-        <div className="gallery">
-          {photos.map((p) => (
-            <div key={p.id} className="gallery-item">
-              <img src={`http://localhost:5000${p.file_path}`} alt="venue" />
+    <div className="seatgeek-gallery">
+      {/* Virtual Tour Section */}
+      {hasVirtualTour && (
+        <div className="virtual-tour-section">
+          <div className="virtual-tour-header">
+            <h3>360° Virtualna Šetnja</h3>
+            <p className="gallery-subtitle">Istražite {venue.name} u 360° panoramskom prikazu</p>
+          </div>
+
+          {!showVirtualTour ? (
+            <div className="virtual-tour-preview" onClick={() => setShowVirtualTour(true)}>
+              <div className="virtual-tour-overlay">
+                <div className="play-button">
+                  <span>▶</span>
+                </div>
+                <span className="tour-label">Kliknite za virtualnu šetnju</span>
+              </div>
             </div>
-          ))}
+          ) : (
+            <div className="virtual-tour-container">
+              <div className="virtual-tour-controls">
+                <button
+                  className="close-tour-btn"
+                  onClick={() => setShowVirtualTour(false)}
+                >
+                  Zatvori virtualnu šetnju
+                </button>
+              </div>
+              <iframe
+                src={getTourUrl()}
+                title="360° Virtual Tour"
+                className="virtual-tour-iframe"
+                allowFullScreen
+              />
+            </div>
+          )}
         </div>
+      )}
+
+      {/* Gallery Header */}
+      <div className="gallery-header">
+        <h3>Seat Views by Section</h3>
+        <p className="gallery-subtitle">Click on a section to see views from that area</p>
+      </div>
+
+      {sections.length === 0 ? (
+        <div className="no-photos-message">
+          <p className="no-content">No seat view photos yet. Be the first to share your view!</p>
+        </div>
+      ) : (
+        <>
+          {/* Section Cards Grid */}
+          <div className="section-cards-grid">
+            {sections.map((sectionName) => {
+              const sectionPhotos = sectionGroups[sectionName];
+              const mainPhoto = sectionPhotos[0];
+              const photoCount = sectionPhotos.length;
+              const ratingsArr = sectionPhotos.map(p => {
+                const ratings = [p.rating_comfort, p.rating_visibility, p.rating_legroom, p.rating_cleanliness].filter(Boolean);
+                return ratings.length ? ratings.reduce((a, b) => a + b, 0) / ratings.length : 0;
+              }).filter(r => r > 0);
+              const avgRating = ratingsArr.length ? ratingsArr.reduce((a, b) => a + b, 0) / ratingsArr.length : 0;
+
+              return (
+                <div
+                  key={sectionName}
+                  className={`section-card ${selectedSection === sectionName ? 'active' : ''}`}
+                  onClick={() => setSelectedSection(selectedSection === sectionName ? null : sectionName)}
+                >
+                  <div className="section-card-image">
+                    {mainPhoto ? (
+                      <img
+                        src={`http://localhost:5000${mainPhoto.file_path}`}
+                        alt={`View from ${sectionName}`}
+                      />
+                    ) : (
+                      <div className="no-image-placeholder">
+                        <span>📷</span>
+                      </div>
+                    )}
+                    <div className="section-card-overlay">
+                      <span className="section-name">Section {sectionName}</span>
+                      <span className="photo-count">{photoCount} {photoCount === 1 ? 'photo' : 'photos'}</span>
+                    </div>
+                  </div>
+                  <div className="section-card-info">
+                    <div className="section-rating">
+                      {avgRating > 0 ? (
+                        <>
+                          <span className="stars">{'★'.repeat(Math.round(avgRating))}{'☆'.repeat(5 - Math.round(avgRating))}</span>
+                          <span className="rating-text">{avgRating.toFixed(1)}</span>
+                        </>
+                      ) : (
+                        <span className="no-rating">No ratings yet</span>
+                      )}
+                    </div>
+                    <div className="section-reviews-count">
+                      {photoCount} {photoCount === 1 ? 'view' : 'views'}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Expanded Section View */}
+          {selectedSection && (
+            <div className="section-expanded">
+              <div className="section-expanded-header">
+                <h4>Views from Section {selectedSection}</h4>
+                <button className="close-btn" onClick={() => setSelectedSection(null)}>✕</button>
+              </div>
+              <div className="section-photos-grid">
+                {sectionGroups[selectedSection].map((photo) => (
+                  <div key={photo.id} className="section-photo-item">
+                    <img
+                      src={`http://localhost:5000${photo.file_path}`}
+                      alt={`View from Section ${selectedSection}`}
+                    />
+                    <div className="photo-info">
+                      <span className="photo-location">
+                        Row {photo.row || '?'}, Seat {photo.seat_number || '?'}
+                      </span>
+                      {photo.text_review && (
+                        <p className="photo-comment">"{photo.text_review}"</p>
+                      )}
+                      <span className="photo-author">by {photo.user_email?.split('@')[0] || 'Anonymous'}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

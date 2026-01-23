@@ -104,9 +104,15 @@ db.serialize(() => {
       name TEXT NOT NULL,
       address TEXT,
       type TEXT,
-      category TEXT DEFAULT 'stadium'
+      category TEXT DEFAULT 'stadium',
+      virtual_tour_url TEXT
     );
   `);
+
+  // Add virtual_tour_url column if it doesn't exist
+  db.run(`ALTER TABLE Venue ADD COLUMN virtual_tour_url TEXT`, (err) => {
+    // Ignore error if column already exists
+  });
 
   // Reviews linked to users
   db.run(`
@@ -210,6 +216,20 @@ db.serialize(() => {
       FOREIGN KEY (follower_id) REFERENCES User(id),
       FOREIGN KEY (following_id) REFERENCES User(id),
       UNIQUE(follower_id, following_id)
+    );
+  `);
+
+  // Review votes (like/dislike)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS ReviewVote (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      review_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      vote_type TEXT NOT NULL CHECK(vote_type IN ('like', 'dislike')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (review_id) REFERENCES Review(id),
+      FOREIGN KEY (user_id) REFERENCES User(id),
+      UNIQUE(review_id, user_id)
     );
   `);
 
@@ -739,6 +759,98 @@ app.get("/api/reviews/:id", async (req, res) => {
   }
 });
 
+// Vote on a review (like/dislike)
+app.post("/api/reviews/:id/vote", authenticateToken, async (req, res) => {
+  try {
+    const reviewId = req.params.id;
+    const { vote_type } = req.body;
+    const userId = req.user.userId;
+
+    if (!vote_type || !['like', 'dislike'].includes(vote_type)) {
+      return res.status(400).json({ error: "vote_type must be 'like' or 'dislike'" });
+    }
+
+    // Check if review exists
+    const review = await getAsync("SELECT id FROM Review WHERE id = ?", [reviewId]);
+    if (!review) {
+      return res.status(404).json({ error: "Review not found" });
+    }
+
+    // Check if user already voted
+    const existingVote = await getAsync(
+      "SELECT id, vote_type FROM ReviewVote WHERE review_id = ? AND user_id = ?",
+      [reviewId, userId]
+    );
+
+    if (existingVote) {
+      if (existingVote.vote_type === vote_type) {
+        // Same vote - remove it (toggle off)
+        await runAsync("DELETE FROM ReviewVote WHERE id = ?", [existingVote.id]);
+        res.json({ message: "Vote removed", action: "removed" });
+      } else {
+        // Different vote - update it
+        await runAsync(
+          "UPDATE ReviewVote SET vote_type = ? WHERE id = ?",
+          [vote_type, existingVote.id]
+        );
+        res.json({ message: "Vote updated", action: "updated", vote_type });
+      }
+    } else {
+      // New vote
+      await runAsync(
+        "INSERT INTO ReviewVote (review_id, user_id, vote_type) VALUES (?, ?, ?)",
+        [reviewId, userId, vote_type]
+      );
+      res.json({ message: "Vote added", action: "added", vote_type });
+    }
+  } catch (err) {
+    console.error("Error voting on review:", err);
+    res.status(500).json({ error: "Failed to vote on review" });
+  }
+});
+
+// Get votes for a review
+app.get("/api/reviews/:id/votes", async (req, res) => {
+  try {
+    const reviewId = req.params.id;
+
+    const votes = await getAsync(
+      `SELECT
+        SUM(CASE WHEN vote_type = 'like' THEN 1 ELSE 0 END) as likes,
+        SUM(CASE WHEN vote_type = 'dislike' THEN 1 ELSE 0 END) as dislikes
+       FROM ReviewVote
+       WHERE review_id = ?`,
+      [reviewId]
+    );
+
+    res.json({
+      likes: votes?.likes || 0,
+      dislikes: votes?.dislikes || 0
+    });
+  } catch (err) {
+    console.error("Error fetching votes:", err);
+    res.status(500).json({ error: "Failed to fetch votes" });
+  }
+});
+
+// Get user's vote on a review
+app.get("/api/reviews/:id/my-vote", authenticateToken, async (req, res) => {
+  try {
+    const reviewId = req.params.id;
+    const userId = req.user.userId;
+
+    const vote = await getAsync(
+      "SELECT vote_type FROM ReviewVote WHERE review_id = ? AND user_id = ?",
+      [reviewId, userId]
+    );
+
+    res.json({ vote_type: vote?.vote_type || null });
+  } catch (err) {
+    console.error("Error fetching user vote:", err);
+    res.status(500).json({ error: "Failed to fetch user vote" });
+  }
+});
+
 // Venue photos
 app.get("/api/venues/:id/photos", async (req, res) => {
   try {
@@ -756,6 +868,39 @@ app.get("/api/venues/:id/photos", async (req, res) => {
   } catch (err) {
     console.error("Error fetching photos:", err);
     res.status(500).json({ error: "Failed to fetch photos" });
+  }
+});
+
+// Venue photos with section info (for SeatGeek-style gallery)
+app.get("/api/venues/:id/gallery", async (req, res) => {
+  try {
+    const rows = await allAsync(
+      `
+      SELECT
+        Photo.id,
+        Photo.file_path,
+        Photo.is_360,
+        Review.section,
+        Review.row,
+        Review.seat_number,
+        Review.text_review,
+        Review.rating_comfort,
+        Review.rating_visibility,
+        Review.rating_legroom,
+        Review.rating_cleanliness,
+        User.email as user_email
+      FROM Photo
+      LEFT JOIN Review ON Photo.review_id = Review.id
+      LEFT JOIN User ON Review.user_id = User.id
+      WHERE Photo.venue_id = ?
+      ORDER BY Review.section, Photo.id DESC
+      `,
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("Error fetching gallery:", err);
+    res.status(500).json({ error: "Failed to fetch gallery" });
   }
 });
 
@@ -777,6 +922,20 @@ app.get("/api/venues/:id/reviews", async (req, res) => {
   } catch (err) {
     console.error("Error fetching reviews:", err);
     res.status(500).json({ error: "Failed to fetch reviews" });
+  }
+});
+
+// Get photos for a specific review
+app.get("/api/reviews/:id/photos", async (req, res) => {
+  try {
+    const photos = await allAsync(
+      "SELECT * FROM ReviewPhoto WHERE review_id = ? ORDER BY id DESC",
+      [req.params.id]
+    );
+    res.json(photos);
+  } catch (err) {
+    console.error("Error fetching review photos:", err);
+    res.status(500).json({ error: "Failed to fetch review photos" });
   }
 });
 
